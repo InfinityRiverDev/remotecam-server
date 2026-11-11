@@ -1,170 +1,44 @@
-const express = require("express");
-const http = require("http");
-const crypto = require("crypto");
-const { WebSocketServer, WebSocket } = require("ws");
+const express = require('express');
+const http = require('http');
+const { WebSocketServer } = require('ws');
 
 const app = express();
 const server = http.createServer(app);
 
-const wss = new WebSocketServer({
-  server,
-  path: "/ws",
-  maxPayload: 256 * 1024
-});
+// Создаем WebSocket сервер на пути /ws
+const wss = new WebSocketServer({ server, path: '/ws' });
 
-const ACCESS_KEY = process.env.ACCESS_KEY;
+// Хранилище для подключенных клиентов (телефонов и браузеров)
+const clients = new Set();
 
-if (!ACCESS_KEY || ACCESS_KEY.length < 24) {
-  console.error(
-    "Ошибка: задайте ACCESS_KEY длиной не менее 24 символов."
-  );
-  process.exit(1);
-}
+wss.on('connection', (ws, req) => {
+  // Получаем роль клиента из URL (phone или web)
+  const urlParams = new URL(req.url, 'http://localhost').searchParams;
+  const role = urlParams.get('role') || 'unknown';
+  
+  ws.role = role;
+  clients.add(ws);
+  console.log(`[${role}] connected. Total: ${clients.size}`);
 
-let phone = null;
-let viewer = null;
-
-app.get("/test", (req, res) => {
-  res.send("Сервер работает");
-});
-
-function keysMatch(value) {
-  if (typeof value !== "string") return false;
-
-  const received = Buffer.from(value, "utf8");
-  const expected = Buffer.from(ACCESS_KEY, "utf8");
-
-  return received.length === expected.length &&
-    crypto.timingSafeEqual(received, expected);
-}
-
-function sendJson(client, message) {
-  if (client && client.readyState === WebSocket.OPEN) {
-    client.send(JSON.stringify(message));
-  }
-}
-
-function sendStatus() {
-  const status = {
-    type: "status",
-    phoneConnected: phone?.readyState === WebSocket.OPEN,
-    viewerConnected: viewer?.readyState === WebSocket.OPEN
-  };
-
-  sendJson(phone, status);
-  sendJson(viewer, status);
-}
-
-wss.on("connection", (socket) => {
-  console.log("Новое WebSocket-подключение, ожидаем авторизацию");
-
-  let role = null;
-
-  const authTimeout = setTimeout(() => {
-    if (!role) {
-      socket.close(1008, "Authentication timeout");
+  // Обработка входящих сообщений
+  ws.on('message', (data) => {
+    // Пересылаем сообщение всем остальным клиентам
+    for (const client of clients) {
+      if (client !== ws && client.readyState === 1) { // 1 означает OPEN
+        client.send(data.toString());
+      }
     }
-  }, 10000);
-
-  socket.on("error", (error) => {
-    console.error("Ошибка WebSocket:", error.message);
   });
 
-  socket.on("message", (data, isBinary) => {
-    if (isBinary) {
-      socket.close(1003, "Text messages only");
-      return;
-    }
-
-    let message;
-
-    try {
-      message = JSON.parse(data.toString());
-    } catch {
-      socket.close(1007, "Invalid JSON");
-      return;
-    }
-
-    if (!role) {
-      if (
-        message.type !== "auth" ||
-        !["phone", "viewer"].includes(message.role) ||
-        !keysMatch(message.key)
-      ) {
-        socket.close(1008, "Authentication failed");
-        return;
-      }
-
-      if (
-        (message.role === "phone" && phone) ||
-        (message.role === "viewer" && viewer)
-      ) {
-        socket.close(1008, "Role already connected");
-        return;
-      }
-
-      clearTimeout(authTimeout);
-      role = message.role;
-
-      if (role === "phone") {
-        phone = socket;
-      } else {
-        viewer = socket;
-      }
-
-      console.log(`[${role}] подключён`);
-
-      sendJson(socket, {
-        type: "auth_ok",
-        role
-      });
-
-      sendStatus();
-      return;
-    }
-
-    const allowedTypes =
-      role === "viewer"
-        ? ["offer", "candidate", "switch_camera"]
-        : ["answer", "candidate"];
-
-    if (!allowedTypes.includes(message.type)) {
-      return;
-    }
-
-    const recipient = role === "phone" ? viewer : phone;
-
-    if (!recipient || recipient.readyState !== WebSocket.OPEN) {
-      sendJson(socket, {
-        type: "peer_unavailable"
-      });
-      return;
-    }
-
-    sendJson(recipient, message);
-  });
-
-socket.on("close", (code, reason) => {
-    console.log(
-        "Соединение закрыто:",
-        code,
-        reason.toString()
-    );
-    clearTimeout(authTimeout);
-
-    if (phone === socket) phone = null;
-    if (viewer === socket) viewer = null;
-
-    if (role) {
-      console.log(`[${role}] отключён`);
-    }
-
-    sendStatus();
+  // Обработка отключения
+  ws.on('close', () => {
+    clients.delete(ws);
+    console.log(`[${role}] disconnected. Total: ${clients.size}`);
   });
 });
 
-const port = Number(process.env.PORT) || 8080;
-
-server.listen(port, "0.0.0.0", () => {
-  console.log(`Сервер запущен на порту ${port}`);
+// Render автоматически передает порт через переменную окружения PORT
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => {
+  console.log(`Signaling server running on port ${PORT}`);
 });
